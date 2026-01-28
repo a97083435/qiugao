@@ -24,3 +24,48 @@
     "url": "https://www.ysxq.cc/api.php/provide/vod"
   }
 ]
+
+
+
+
+
+
+
+
+
+{
+  "storeHouse": [
+    {
+      "sourceName": "❤️蜗牛科技仓🍭蜗牛精选🍭",
+      "sourceUrl": "https://tv.蜗牛.top/DS"
+    },
+    {
+      "sourceName": "💜蜗牛星辰仓🍭蜗牛提醒🍭",
+      "sourceUrl": "http://150.158.112.123/dc.json"
+    },
+    {
+      "sourceName": "💚蜗牛天微仓🍭软件接口🍭",
+      "sourceUrl": "http://qxyc.cc/%E8%87%AA%E7%94%A8%E6%B5%8B%E8%AF%95"
+    },
+    {
+      "sourceName": "💛蜗牛拾光仓🍭完全免费🍭",
+      "sourceUrl": "https://4708.kstore.space/ck.json"
+    },
+    {
+      "sourceName": "💙蜗牛讴歌仓🍭严禁贩卖🍭",
+      "sourceUrl": "https://xn--wqqw-wn6lw489o.v.nxog.top/nxog/oua.php?b=wq装🅱qw"
+    },
+    {
+      "sourceName": "🧡蜗牛挺好仓🍭蜗牛科技🍭",
+      "sourceUrl": "http://ztha.top/TVBox/GYCK.json"
+    },
+    {
+      "sourceName": "🤍蜗牛多多仓🍭不做韭菜🍭",
+      "sourceUrl": "https://bitbucket.org/xduo/cool/raw/main/ck/公众号多多影音.txt"
+    },
+    {
+      "sourceName": "💖蜗牛科技仓🍭本地多仓🍭",
+      "sourceUrl": "clan://localhost/TVBoxOSC/本地仓/本地仓.txt"
+    }
+  ]
+}
