@@ -8,6 +8,7 @@
 - liveContent(url) 签名修正；detailContent 支持空 list 与完整 ID list；新增 homeVideoContent；
 - 删掉新 API 已移除的 getName / getDependence / download / manualVideoCheck / isVideoFormat / isVPAYard / action；
 - 去掉重复定义的 _aes_is_fast；playerContent 先校验 vid 再联网注册，避免坏 ID 也等一轮网络。
+2026-11-17 v2：实测复现不能播——playerContent 原先不等会话建好就先回 127.0.0.1 地址，播放器连上来时会话还在取 video_model（本机沙箱 video_model 回 200 空正文），等 15 秒超时黑屏。本版改为同步建好会话再回地址，建不起来回明确 msg、不给死地址；另加 ext play_mode=proxy 可强制走壳代理。
 配置见 hongguo-config.json：{"key":"hongguo","name":"红果短剧","type":3,"api":"hongguo.py","ext":""}
 """
 from __future__ import annotations
@@ -752,6 +753,10 @@ def _first(*values: Any) -> str:
 
 def _json_response(response: requests.Response) -> Any:
     response.raise_for_status()
+    if not getattr(response, "content", None):
+        # video_model 常见回法：HTTP 200 + 空正文 = 上游拒绝该设备/IP/签名，轮换设备重试也无用，
+        # 要报成“数据为空”而不是笼统的 JSON 错误，调用方才能识别并早停。
+        raise HongguoPluginError("video_model 数据为空")
     try:
         return response.json()
     except ValueError as exc:
@@ -1022,7 +1027,7 @@ _STREAM_CHUNK = 1 << 20
 _STREAM_HEAD_PROBE = 1 << 16
 _STREAM_TTL_SECONDS = 900
 _STREAM_MAX_SESSIONS = 4
-_STREAM_INFLIGHT_WAIT = 60
+_STREAM_INFLIGHT_WAIT = 25  # v2：播放器读超时约 8s，等 60s 没有意义，早失败早报 msg
 _STREAM_STATE: dict[str, Any] = {"port": 0, "server": None, "sessions": {}, "inflight": {}}
 _STREAM_LOCK = threading.RLock()
 
@@ -1382,8 +1387,11 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
         if session is not None:
             return session
     last_err = None
+    _started = time.time()
     try:
         # 上游偶发抖动（同一集首次 502、重试即通）——冷启动这里做短重试。
+        # v2：空正文不是偶发抖动（设备/IP/签名被拒时连换设备也空），2 轮后即停，总耗时不超 25s，
+        # 否则播放器在等会话时先超时，playerContent 回的地址就成了死地址。
         for _attempt in range(3):
             try:
                 model = _video_model_rotating(video_id, config)
@@ -1408,6 +1416,14 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
                 return session
             except Exception as err:
                 last_err = err
+                try:
+                    _STREAM_STATE["last_error"] = "%s: %s" % (type(err).__name__, err)
+                except Exception:
+                    pass
+                if _is_empty_model_error(err) and _attempt >= 1:
+                    break
+                if time.time() - _started > 20:
+                    break
                 try:
                     time.sleep(0.4 * (_attempt + 1))
                 except Exception:
@@ -1505,8 +1521,8 @@ class _StreamHandler(BaseHTTPRequestHandler):
                 },
                 params["quality"],
             )
-        except Exception:
-            self._fail(502, b"media session failed")
+        except Exception as err:
+            self._fail(502, ("media session failed: %s" % err).encode("utf-8", "ignore")[:200])
             return
         raw_range = self.headers.get("Range") or ""
         requested = _parse_range(raw_range, session.total)
@@ -4170,6 +4186,15 @@ class Spider(_BaseSpider):
 
     def init(self, extend=""):
         # 每次源实例使用随机合法设备标识；不依赖用户私有配置。
+        # ext 可传 {"play_mode": "proxy"} 强制走壳代理（流服务建不起来时备用）；默认 "stream"。
+        self.play_mode = "stream"
+        try:
+            if extend:
+                _opt = json.loads(extend) if isinstance(extend, str) else extend
+                if isinstance(_opt, dict) and str(_opt.get("play_mode") or "").strip() in ("proxy", "stream"):
+                    self.play_mode = str(_opt.get("play_mode")).strip()
+        except Exception:
+            pass
         try:
             _hg_cache_cleanup(False)
         except Exception:
@@ -4346,48 +4371,39 @@ class Spider(_BaseSpider):
                 break
         q = line_q if token_q == "1080" and str(flag) else token_q
         q = q if q in _QUALITY_LINE_NAME_TO_Q else "1080"
-        # 取流优先级：本机 Range 流服务 > 壳代理。
-        # 壳代理（fongmi / OK影视 的 /proxy?do=py）实测会忽略 Range：对 bytes=0-1023
-        # 也回 200 + 整片 + chunked，既无 Content-Range 也无 Accept-Ranges，且必须
-        # 等整片下载 + CENC 解密完成后才吐首字节（单集 12~17MB，实测 8.7s / 16.3s，
-        # 超过播放器默认 8s 读超时）。首集常因缓存或重试侥幸起播，切到第二集时播放器
-        # 按新 URL 重新请求即超时失败，表现为“第 1 集能放、第 2 集不能放”。
-        # 本机流服务支持 206 / Content-Range / Accept-Ranges，首字节约 1s，切集稳定。
-        # 会话构建（取 video_model + 拉 moov）在冷启动时约 3~18s，若等到播放器连上来
-        # 才建会话，响应头会被拖延到读超时。这里先异步预热会话，让播放器连接时命中缓存。
-        def _warm_session():
+        cfg = {
+            "device_id": self.device_id or "",
+            "install_id": self.install_id or "",
+        }
+        last_err = None
+        session_ok = False
+        # v2（不能播的根因修复）：原版这里只异步预热会话、立刻回 127.0.0.1 地址，
+        # 播放器连上来时会话往往还没建好（取 video_model + 拉 moov 要几秒到十几秒，
+        # 本机复现：video_model 回 200 空正文，会话永远建不起来），播放器等响应头等到
+        # 15 秒超时黑屏。本版在 playerContent 里同步把会话建好再回地址：
+        # 建好了，播放器连上来即有数据；建不好，直接回 msg，不给死地址。
+        if getattr(self, "play_mode", "stream") != "proxy":
             try:
-                _stream_session(vid, {
-                    "device_id": self.device_id or "",
-                    "install_id": self.install_id or "",
-                }, q)
+                _stream_session(vid, cfg, q)
+                session_ok = True
+            except Exception as err:
+                last_err = err
+        if session_ok:
+            try:
+                port = _start_stream_server()
             except Exception:
-                pass
-        try:
-            threading.Thread(target=_warm_session, daemon=True).start()
-        except Exception:
-            pass
-        try:
-            port = _start_stream_server()
-        except Exception:
-            port = 0
-        if port:
-            query = urlencode(
-                {
-                    "vid": vid,
-                    "q": q,
-                    "did": self.device_id or "",
-                    "iid": self.install_id or "",
+                port = 0
+            if port:
+                query = urlencode({"vid": vid, "q": q, "did": self.device_id or "", "iid": self.install_id or ""})
+                return {
+                    "parse": 0,
+                    "jx": 0,
+                    "playUrl": "",
+                    "url": "http://127.0.0.1:%d/hg.mp4?%s" % (port, query),
+                    "header": {"User-Agent": UA},
                 }
-            )
-            return {
-                "parse": 0,
-                "jx": 0,
-                "playUrl": "",
-                "url": "http://127.0.0.1:%d/hg.mp4?%s" % (port, query),
-                "header": {"User-Agent": UA},
-            }
-        # 回退：壳代理（保留壳自带的 do=py，不要覆盖 do）
+        # 会话没建好 / 流服务起不来：先试壳代理（localProxy 会再取一次模型，大陆 IP 上
+        # 有时流服务失败、代理能通；反之亦然）。壳代理也没有时回明确 msg。
         proxy = ""
         try:
             if hasattr(self, "getProxyUrl"):
@@ -4396,25 +4412,24 @@ class Spider(_BaseSpider):
             proxy = ""
         if proxy:
             sep = "&" if "?" in proxy else "?"
-            url = proxy + sep + urlencode(
-                {
-                    "vid": vid,
-                    "q": q,
-                    "hg": "cenc",
-                    "did": self.device_id or "",
-                    "iid": self.install_id or "",
-                }
-            )
+            url = proxy + sep + urlencode({"vid": vid, "q": q, "hg": "cenc", "did": self.device_id or "", "iid": self.install_id or ""})
             return {
                 "parse": 0,
                 "jx": 0,
                 "playUrl": "",
                 "url": url,
-                "header": {
-                    "User-Agent": MEDIA_UA,
-                    "Referer": "https://novel.snssdk.com/",
-                },
+                "header": {"User-Agent": MEDIA_UA, "Referer": "https://novel.snssdk.com/"},
             }
+        if getattr(self, "play_mode", "stream") == "proxy":
+            _msg = "壳代理不可用：当前壳没给 getProxyUrl，请把 ext 里的 play_mode 改回 stream 再试"
+        else:
+            _msg = "红果取流失败：%s（video_model 回空常见于非大陆 IP、设备被拒或签名过期；若在大陆手机上也报这句，把这句原样发回来）" % (last_err or "媒体会话创建失败")
+        return {
+            "parse": 0,
+            "jx": 0,
+            "url": "",
+            "msg": _msg,
+        }
         return {
             "parse": 1,
             "jx": 0,
