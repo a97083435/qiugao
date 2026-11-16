@@ -8,6 +8,7 @@
 - liveContent(url) 签名修正；detailContent 支持空 list 与完整 ID list；新增 homeVideoContent；
 - 删掉新 API 已移除的 getName / getDependence / download / manualVideoCheck / isVideoFormat / isVPAYard / action；
 - 去掉重复定义的 _aes_is_fast；playerContent 先校验 vid 再联网注册，避免坏 ID 也等一轮网络。
+2026-11-17 v3：用户实机也报 video_model 数据为空，说明不是本机 IP 问题。v3 在 _video_model 里按顺序试 6 路取流：原签 71332、签 73532（与设备注册的 7.3.5.32 对齐）、签 71332+ttwid、reading 无签 aid1967、reading 无签 aid8662、sinfonlineb 无签 aid8662，首路有数据即停，全空时把每路状态写进报错里。
 2026-11-17 v2：实测复现不能播——playerContent 原先不等会话建好就先回 127.0.0.1 地址，播放器连上来时会话还在取 video_model（本机沙箱 video_model 回 200 空正文），等 15 秒超时黑屏。本版改为同步建好会话再回地址，建不起来回明确 msg、不给死地址；另加 ext play_mode=proxy 可强制走壳代理。
 配置见 hongguo-config.json：{"key":"hongguo","name":"红果短剧","type":3,"api":"hongguo.py","ext":""}
 """
@@ -1420,8 +1421,8 @@ def _stream_session(video_id: str, config: Mapping[str, Any], quality: str = "10
                     _STREAM_STATE["last_error"] = "%s: %s" % (type(err).__name__, err)
                 except Exception:
                     pass
-                if _is_empty_model_error(err) and _attempt >= 1:
-                    break
+                if _is_empty_model_error(err):
+                    break  # v3：_video_model 内部已试 6 路，全空再重跑一遍只是浪费时间
                 if time.time() - _started > 20:
                     break
                 try:
@@ -3664,79 +3665,30 @@ def _device_config(config: Mapping[str, Any]) -> dict[str, str]:
         "ua": APP_UA,
     }
 
-def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
-    devices = _device_config(config)
-    params = {
-        "iid": devices["install_id"],
-        "device_id": devices["device_id"],
-        "ac": "wifi",
-        "channel": "update_64",
-        "aid": "8662",
-        "app_name": "novelread",
-        "version_code": "71332",
-        "version_name": "7.1.3.32",
-        "device_platform": "android",
-        "os": "android",
-        "ssmix": "a",
-        "device_type": "25053RT47C",
-        "device_brand": "Redmi",
-        "language": "zh",
-        "os_api": "36",
-        "os_version": "16",
-        "manifest_version_code": "71332",
-        "resolution": "1280*2772",
-        "dpi": "520",
-        "update_version_code": "71332",
-        "host_abi": "arm64-v8a",
-        "dragon_device_type": "phone",
-        "pv_player": "71332",
-        "compliance_status": "0",
-        "need_personal_recommend": "1",
-        "player_so_load": "1",
-        "is_android_pad_screen": "0",
-    }
-    payload = {
-        "biz_param": {
-            "detail_page_version": 0,
-            "device_level": 3,
-            "disable_digg_stat": False,
-            "need_all_video_definition": True,
-            "need_mp4_align": False,
-            "use_os_player": False,
-            "use_server_dns": False,
-            "video_platform": 1024,
-        },
-        "mixed_video_id_map": {"1004": [video_id]},
-    }
-    request_headers = {
-        "User-Agent": APP_UA,
-        "Accept": "application/json; charset=utf-8,application/x-protobuf",
-        "Content-Type": "application/json; charset=UTF-8",
-        "x-xs-from-web": "0",
-        "x-ss-req-ticket": str(int(time.time() * 1000)),
-        "x-tt-request-tag": "t=0;n=0",
-        "sdk-version": "2",
-        "passport-sdk-version": "50561",
-        "x-vc-bdturing-sdk-version": "3.7.2.cn",
-    }
-    if devices.get("cookie"):
-        request_headers["Cookie"] = devices["cookie"]
-    signed_headers, signed_url = _core_sixgod(
-        VIDEO_URL,
-        params,
-        devices,
-        payload,
-        request_headers,
-    )
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    response = requests.post(
-        signed_url,
-        headers=signed_headers,
-        data=body,
-        timeout=30,
-    )
-    response_data = _json_response(response)
-    data = response_data.get("data") or {}
+def _get_ttwid() -> str:
+    """取官网首页的 ttwid cookie（搜索接口缺了它只回空列表，取流可能同理），缓存复用。"""
+    try:
+        cached = str(_STREAM_STATE.get("ttwid") or "")
+        if cached:
+            return cached
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.headers.update({"User-Agent": UA})
+        sess.get(SITE + "/", timeout=10)
+        value = ""
+        try:
+            value = str(sess.cookies.get("ttwid") or "")
+        except Exception:
+            value = ""
+        if value:
+            _STREAM_STATE["ttwid"] = value
+        return value
+    except Exception:
+        return ""
+
+
+def _parse_video_model_response(response_data: Any, video_id: str) -> dict[str, Any]:
+    data = (response_data or {}).get("data") or {}
     if not isinstance(data, Mapping):
         raise HongguoPluginError("video_model 数据为空")
     entry: Any = data.get(video_id)
@@ -3759,8 +3711,143 @@ def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
         except ValueError as exc:
             raise HongguoPluginError("video_model JSON 无效") from exc
     if not isinstance(raw_model, Mapping):
-        raise HongguoPluginError("video_model 为空")
+        raise HongguoPluginError("video_model 数据为空")
     return dict(raw_model)
+
+
+def _signed_video_model(video_id: str, config: Mapping[str, Any], version_code: str, version_name: str, ua: str, cookie: str = "") -> dict[str, Any]:
+    devices = _device_config(config)
+    devices = dict(devices)
+    devices["version_name"] = version_name
+    devices["ua"] = ua
+    if cookie:
+        devices["cookie"] = cookie
+    params = {
+        "iid": devices["install_id"],
+        "device_id": devices["device_id"],
+        "ac": "wifi",
+        "channel": "update_64",
+        "aid": "8662",
+        "app_name": "novelread",
+        "version_code": version_code,
+        "version_name": version_name,
+        "device_platform": "android",
+        "os": "android",
+        "ssmix": "a",
+        "device_type": "25053RT47C",
+        "device_brand": "Redmi",
+        "language": "zh",
+        "os_api": "36",
+        "os_version": "16",
+        "manifest_version_code": version_code,
+        "resolution": "1280*2772",
+        "dpi": "520",
+        "update_version_code": version_code,
+        "host_abi": "arm64-v8a",
+        "dragon_device_type": "phone",
+        "pv_player": version_code,
+        "compliance_status": "0",
+        "need_personal_recommend": "1",
+        "player_so_load": "1",
+        "is_android_pad_screen": "0",
+    }
+    payload = {
+        "biz_param": {
+            "detail_page_version": 0,
+            "device_level": 3,
+            "disable_digg_stat": False,
+            "need_all_video_definition": True,
+            "need_mp4_align": False,
+            "use_os_player": False,
+            "use_server_dns": False,
+            "video_platform": 1024,
+        },
+        "mixed_video_id_map": {"1004": [video_id]},
+    }
+    request_headers = {
+        "User-Agent": ua,
+        "Accept": "application/json; charset=utf-8,application/x-protobuf",
+        "Content-Type": "application/json; charset=UTF-8",
+        "x-xs-from-web": "0",
+        "x-ss-req-ticket": str(int(time.time() * 1000)),
+        "x-tt-request-tag": "t=0;n=0",
+        "sdk-version": "2",
+        "passport-sdk-version": "50561",
+        "x-vc-bdturing-sdk-version": "3.7.2.cn",
+    }
+    if devices.get("cookie"):
+        request_headers["Cookie"] = devices["cookie"]
+    signed_headers, signed_url = _core_sixgod(VIDEO_URL, params, devices, payload, request_headers)
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    response = requests.post(signed_url, headers=signed_headers, data=body, timeout=30)
+    response_data = _json_response(response)
+    return _parse_video_model_response(response_data, video_id)
+
+
+def _unsigned_video_model(video_id: str, host: str, aid: str) -> dict[str, Any]:
+    """FQ-novel 公开写法：reading.snssdk.com，无签名、无设备、无 Gorgon，payload 用 video_id。
+    本机沙箱同样回空正文（见 v3 说明），但在大陆手机上是另一路可能通的取流。"""
+    payload = {
+        "biz_param": {
+            "device_level": 3,
+            "need_all_video_definition": False,
+            "need_mp4_align": False,
+            "use_os_player": False,
+            "video_platform": 1024,
+        },
+        "video_id": video_id,
+    }
+    url = host + "/novel/player/multi_video_model/v1/?aid=" + aid
+    response = requests.post(
+        url,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/97.0.4692.99 Safari/537.36",
+        },
+        data=json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        timeout=20,
+    )
+    response_data = _json_response(response)
+    return _parse_video_model_response(response_data, video_id)
+
+
+def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
+    """按顺序试多路取流，首路有数据即停；全空时把每路状态写进报错，供用户原样发回排障。
+    v3 变体（按可能性排序）：
+    1 signed-71332：原版（设备注册用 7.3.5.32，取流却报 7.1.3.32，版本不一致可能是被拒原因）；
+    2 signed-73532：版本与设备注册对齐为 7.3.5.32 / 73532；
+    3 signed-71332+ttwid：原版 + 官网 ttwid cookie；
+    4 unsigned-1967：reading.snssdk.com aid=1967 无签（FQ-novel 公开写法）；
+    5 unsigned-8662：reading.snssdk.com aid=8662 无签；
+    6 unsigned-sinf：api5-normal-sinfonlineb aid=8662 无签。"""
+    attempts: list[str] = []
+    ua73532 = "com.phoenix.read/73532 (Linux; U; Android 16; zh_CN; 25053RT47C; Build/BP2A.250605.031.A3; Cronet/TTNetVersion:04657795 2026-01-23 QuicVersion:c67e9834 2025-09-08)"
+    variants = [
+        ("signed-71332", lambda: _signed_video_model(video_id, config, "71332", "7.1.3.32", APP_UA)),
+        ("signed-73532", lambda: _signed_video_model(video_id, config, "73532", "7.3.5.32", ua73532)),
+        ("signed-71332+ttwid", lambda: _signed_video_model(video_id, config, "71332", "7.1.3.32", APP_UA, cookie=("ttwid=" + _get_ttwid()) if _get_ttwid() else "")),
+        ("unsigned-1967", lambda: _unsigned_video_model(video_id, "https://reading.snssdk.com", "1967")),
+        ("unsigned-8662", lambda: _unsigned_video_model(video_id, "https://reading.snssdk.com", "8662")),
+        ("unsigned-sinf", lambda: _unsigned_video_model(video_id, "https://api5-normal-sinfonlineb.fqnovel.com", "8662")),
+    ]
+    last_err: Exception | None = None
+    for label, fn in variants:
+        try:
+            model = fn()
+            try:
+                _STREAM_STATE["video_model_ok"] = label
+            except Exception:
+                pass
+            return model
+        except Exception as err:
+            last_err = err
+            attempts.append("%s:%s" % (label, err))
+    try:
+        _STREAM_STATE["video_model_attempts"] = ";".join(attempts)
+    except Exception:
+        pass
+    raise HongguoPluginError("video_model 数据为空（已试 %s）" % ", ".join(attempts))
+
 
 def _video_list_from_model(model: Mapping[str, Any]) -> Any:
     for key in ("video_list", "dynamic_video_list"):
