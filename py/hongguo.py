@@ -16,6 +16,14 @@ v5（2026-11-17）：v4 实机仍报 video_model 空后彻底重写取流路径�
   在本机仍回 200 空正文（本机 store-region=us，播放接口疑似按地区放行），
   只能靠大陆手机实测。报错里带 v5 标记与每台设备的尝试结果，方便定位。
 
+v5.1（2026-11-17）：实机报“读取媒体失败 · ERROR_CODE_IO_BAD_HTTP_STATUS”。
+查到本地流服务的 `_serve` 仍按旧签名调 `_stream_session(vid, config, quality)`，
+在 v5 里会把 config 当成 series_id、把 quality 当成 config，清晰度恒被当成
+1080——非 1080 线路播放器回连时一律缓存失效，只能重新取流，取不到就回 502，
+播放器正好报这个错。已修：播放地址带上 sid，`_serve` 按新签名传参；桩测验证
+720 线路建会话后播放器经 handler 能 206 命中缓存（取流被禁用的情况下仍 206，
+证明不再重新取流）。
+
 配置见 hongguo-config.json：{"key":"hongguo","name":"红果短剧","type":3,"api":"hongguo.py","ext":""}
 """
 from __future__ import annotations
@@ -1338,6 +1346,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         return {
             "vid": video_id if video_id.isdigit() else "",
             "quality": (query.get("q") or ["1080"])[0],
+            "series_id": (query.get("sid") or [""])[0],
             "device_id": (query.get("did") or [""])[0],
             "install_id": (query.get("iid") or [""])[0],
         }
@@ -1369,13 +1378,12 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self._fail(400, b"missing vid")
             return
         try:
+            # v5.1 修复：旧调用按老签名传参（vid, config, quality），
+            # 在 v5 里会把 config 当成 series_id、把 quality 当成 config，
+            # 清晰度恒被当成 1080——非 1080 线路播放器一律缓存失效，
+            # 只能重新取流，取不到就 502，播放器报 ERROR_CODE_IO_BAD_HTTP_STATUS。
             session = _stream_session(
-                params["vid"],
-                {
-                    "device_id": params["device_id"],
-                    "install_id": params["install_id"],
-                },
-                params["quality"],
+                params["vid"], params["series_id"], {}, params["quality"]
             )
         except Exception as err:
             self._fail(502, ("media session failed: %s" % err).encode("utf-8", "ignore")[:200])
@@ -4654,7 +4662,8 @@ class Spider(_BaseSpider):
             except Exception:
                 port = 0
             if port:
-                query = urlencode({"vid": vid, "q": q})
+                # v5.1：地址里带上 sid，播放器回连本地流服务时才能按原清晰度命中会话。
+                query = urlencode({"vid": vid, "q": q, "sid": series_id})
                 return {
                     "parse": 0,
                     "jx": 0,
