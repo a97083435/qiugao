@@ -8,6 +8,7 @@
 - liveContent(url) 签名修正；detailContent 支持空 list 与完整 ID list；新增 homeVideoContent；
 - 删掉新 API 已移除的 getName / getDependence / download / manualVideoCheck / isVideoFormat / isVPAYard / action；
 - 去掉重复定义的 _aes_is_fast；playerContent 先校验 vid 再联网注册，避免坏 ID 也等一轮网络。
+2026-11-17 v4：实机 6 路全空后，参照 openhongguo SDK（2026-10-26 发布，抓包 2026-10-24 官方客户端 7.3.9.32）重写取流：旧 multi_video_model/sinfonlineb 已死，新接口是单 video_model + sinfonlinea + 真 Argus 551/Ladon 签名（无 Medusa）+ tt-data 设备注册，每台新设备只给一次播放模型。
 2026-11-17 v3：用户实机也报 video_model 数据为空，说明不是本机 IP 问题。v3 在 _video_model 里按顺序试 6 路取流：原签 71332、签 73532（与设备注册的 7.3.5.32 对齐）、签 71332+ttwid、reading 无签 aid1967、reading 无签 aid8662、sinfonlineb 无签 aid8662，首路有数据即停，全空时把每路状态写进报错里。
 2026-11-17 v2：实测复现不能播——playerContent 原先不等会话建好就先回 127.0.0.1 地址，播放器连上来时会话还在取 video_model（本机沙箱 video_model 回 200 空正文），等 15 秒超时黑屏。本版改为同步建好会话再回地址，建不起来回明确 msg、不给死地址；另加 ext play_mode=proxy 可强制走壳代理。
 配置见 hongguo-config.json：{"key":"hongguo","name":"红果短剧","type":3,"api":"hongguo.py","ext":""}
@@ -16,6 +17,7 @@ from __future__ import annotations
 import base64
 import binascii
 import bisect
+import gzip
 import hashlib
 import json
 import os
@@ -342,6 +344,23 @@ def _aes_cbc_decrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
     if AES_BACKEND == "pycryptodome":
         return CryptoAES.new(key, CryptoAES.MODE_CBC, iv).decrypt(data)
     return _pure_cbc_decrypt(key, iv, data)
+
+
+def _aes_cbc_encrypt(key: bytes, iv: bytes, data: bytes) -> bytes:
+    if AES_BACKEND == "cryptography":
+        encryptor = Cipher(algorithms.AES(key), modes.CBC(iv)).encryptor()
+        return encryptor.update(data) + encryptor.finalize()
+    if AES_BACKEND == "pycryptodome":
+        return CryptoAES.new(key, CryptoAES.MODE_CBC, iv).encrypt(data)
+    aes = _PureAES128(key)
+    prev = iv[:16].ljust(16, b"\0")
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        block = bytes(a ^ p for a, p in zip(data[i:i + 16], prev))
+        enc = aes.encrypt_block(block)
+        out.extend(enc)
+        prev = enc
+    return bytes(out)
 
 
 SITE = "https://hongguoduanju.com"
@@ -3811,7 +3830,365 @@ def _unsigned_video_model(video_id: str, host: str, aid: str) -> dict[str, Any]:
     return _parse_video_model_response(response_data, video_id)
 
 
+# ================= v4：2026-10 官方客户端新协议 =================
+# 根因（2026-11-17 实机 6 路全空后，参照 2026-10-26 发布的 openhongguo SDK 查到）：
+# 旧版调的是 /novel/player/multi_video_model/v1/（sinfonlineb 域名、7.1.3.32），
+# 而 2026-10-24 抓包的官方客户端（com.phoenix.read 7.3.9.32）走的是
+# /novel/player/video_model/v1/（单接口、sinfonlinea 域名），且从 2026-11-10 起
+# 播放接口只认真正的 Argus 551 + Ladon 签名（x-argus/x-ladon 不能再用 4 字节
+# 时间戳桩，带 Medusa 反而回空正文），每台匿名设备基本只给一次播放模型。
+# v4 按这套协议重写取流：新设备注册（tt-data 加密体，log5-applog-lq）、
+# 单接口 video_model、真 Argus/Ladon、无 Medusa，每次只用新设备试一次，
+# 空了就换一台新设备再试（默认 2 台，_video_model_rotating 层还会再补）。
+_OHG_VERSION_NAME = "7.3.9.32"
+_OHG_VERSION_CODE = "73932"
+_OHG_API_HOST = "api5-normal-sinfonlinea.fqnovel.com"
+_OHG_REGISTER_HOST = "log5-applog-lq.fqnovel.com"
+_OHG_PLAYBACK_PATH = "/novel/player/video_model/v1/"
+_OHG_UA = "com.phoenix.read/73932 (Linux; U; Android 14; zh_CN; 23127PN0CC; Build/UKQ1.230804.001; Cronet/TTNetVersion:8d40f833 2026-03-03 QuicVersion:21ac1950 2025-11-18)"
+_OHG_DEVICE = {"brand": "Xiaomi", "model": "23127PN0CC", "os_version": "14", "os_api": 34, "build": "UKQ1.230804.001", "resolution": "1200*2670", "dpi": 460, "channel": "xiaomi_8662_64"}
+_OHG_MAX_DEVICES = 2  # _video_model_rotating 层空了还会再换一台，总共约 4 台
+
+
+def _ohg_uuid(raw16: bytes) -> str:
+    b = bytearray(raw16[:16])
+    b[6] = (b[6] & 0x0F) | 0x40
+    b[8] = (b[8] & 0x3F) | 0x80
+    h = b.hex()
+    return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+
+
+def _ohg_new_profile() -> dict[str, str]:
+    raw = os.urandom(72)
+    return {
+        "cdid": _ohg_uuid(raw[0:16]),
+        "openudid": raw[16:24].hex(),
+        "clientudid": _ohg_uuid(raw[24:40]),
+        "oaid": _ohg_uuid(raw[40:56]),
+        "req_id": _ohg_uuid(raw[56:72]),
+    }
+
+
+def _ohg_tt_encrypt(data: bytes) -> bytes:
+    const = bytes.fromhex("4dd4c2e6b83162090e52b3c7a6733ba41cb2462b829ab58a196b39db57177524f49baf7f08e8d68d26a72e37c1a95a2f1f05a51892aef2949732b62a38aadd58")
+    prefix = bytes.fromhex("3176c9b6d71579d7e82179c9e7cbde787b54d541bad3b15f2e8fed92293fa25a")
+    prefix_hash = hashlib.sha512(prefix).digest()
+    key_iv = hashlib.sha512(prefix_hash + const).digest()
+    plain = hashlib.sha512(data).digest() + data
+    pad = 16 - len(plain) % 16
+    plain += bytes([pad]) * pad
+    return b"\x74\x63\x05\x10\x00\x00" + prefix + _aes_cbc_encrypt(key_iv[:16], key_iv[16:32], plain)
+
+
+def _ohg_register_body(profile: Mapping[str, str], now_ms: int) -> bytes:
+    oaid = profile["oaid"]
+    oaid_obj = {"hw_id_version_code": "0", "id": oaid, "is_track_limited": "false", "query_times": "1", "req_id": oaid, "take_ms": "6", "time": str(now_ms - 200)}
+    header = {
+        "display_name": "红果免费短剧", "update_version_code": 73932, "manifest_version_code": 73932,
+        "app_version_minor": _OHG_VERSION_NAME, "aid": 8662, "channel": _OHG_DEVICE["channel"],
+        "package": "com.phoenix.read", "app_version": _OHG_VERSION_NAME, "version_code": 73932,
+        "os": "Android", "os_version": _OHG_DEVICE["os_version"], "os_api": _OHG_DEVICE["os_api"],
+        "device_model": _OHG_DEVICE["model"], "device_brand": _OHG_DEVICE["brand"],
+        "device_manufacturer": _OHG_DEVICE["brand"], "cpu_abi": "arm64-v8a", "language": "zh",
+        "timezone": 8, "access": "wifi", "region": "CN", "tz_name": "Asia/Shanghai", "tz_offset": 28800,
+        "cdid": profile["cdid"], "openudid": profile["openudid"], "clientudid": profile["clientudid"],
+        "ipv6_list": [], "sim_serial_number": [], "oaid": oaid_obj, "oaid_may_support": True,
+        "req_id": profile["req_id"], "device_platform": "android", "guest_mode": 0, "is_system_app": 0,
+        "sdk_flavor": "china", "device_id": "0", "install_id": "0",
+    }
+    order = ["display_name", "update_version_code", "manifest_version_code", "app_version_minor", "aid", "channel", "package", "app_version", "version_code", "os", "os_version", "os_api", "device_model", "device_brand", "device_manufacturer", "cpu_abi", "language", "timezone", "access", "region", "tz_name", "tz_offset", "cdid", "openudid", "clientudid", "ipv6_list", "sim_serial_number", "oaid", "oaid_may_support", "req_id", "device_platform", "guest_mode", "is_system_app", "sdk_flavor", "device_id", "install_id"]
+    parts = []
+    for key in order:
+        value = header[key]
+        if isinstance(value, dict):
+            value_json = "{" + ",".join(json.dumps(k) + ":" + json.dumps(value[k], ensure_ascii=False, separators=(",", ":")) for k in sorted(value.keys())) + "}"
+        else:
+            value_json = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        parts.append(json.dumps(key) + ":" + value_json)
+    header_json = "{" + ",".join(parts) + "}"
+    plain = ('{"magic_tag":"ss_app_log","header":' + header_json + ',"_gen_time":' + str(now_ms) + "}").encode("utf-8")
+    gz = gzip.compress(plain, compresslevel=6, mtime=now_ms // 1000)
+    return _ohg_tt_encrypt(gz)
+
+
+def _ohg_cookie_from_response(resp: Any, name: str) -> str:
+    try:
+        cookies = getattr(resp, "cookies", None)
+        if cookies is not None:
+            value = cookies.get(name) if hasattr(cookies, "get") else None
+            if value:
+                return str(value)
+    except Exception:
+        pass
+    try:
+        headers = getattr(resp, "headers", {}) or {}
+        raw = headers.get("Set-Cookie") or headers.get("set-cookie") or ""
+        for part in str(raw).split(","):
+            item = part.strip()
+            if item.startswith(name + "="):
+                return item[len(name) + 1:].split(";")[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _ohg_register_profile(profile: Mapping[str, str]) -> dict[str, str]:
+    """新协议设备注册：tt-data 加密体发到 log5-applog-lq，拿 device_id/install_id + ttreq cookie。"""
+    now_ms = int(time.time() * 1000)
+    body = _ohg_register_body(profile, now_ms)
+    resp = requests.post(
+        "https://" + _OHG_REGISTER_HOST + "/service/2/device_register/?" + urlencode({"req_id": profile["req_id"], "tt_data": "a"}),
+        data=body,
+        headers={
+            "User-Agent": _OHG_UA, "Content-Type": "application/octet-stream;tt-data=a",
+            "log-encode-type": "gzip", "sdk-version": "2", "passport-sdk-version": "5051452",
+            "x-vc-bdturing-sdk-version": "4.0.3.cn", "x-ss-dp": "8662",
+            "X-SS-STUB": hashlib.md5(body).hexdigest().upper(),
+        },
+        timeout=20,
+    )
+    if resp.status_code != 200:
+        raise HongguoPluginError("设备注册失败 HTTP %s" % resp.status_code)
+    data = resp.json()
+    did = str(data.get("device_id_str") or data.get("device_id") or "")
+    iid = str(data.get("install_id_str") or data.get("install_id") or "")
+    if not did.isdigit() or not iid.isdigit() or did == "0" or iid == "0":
+        raise HongguoPluginError("设备注册未返回设备身份")
+    return {
+        "device_id": did, "install_id": iid,
+        "ttreq": _ohg_cookie_from_response(resp, "ttreq"),
+        "store_region": _ohg_cookie_from_response(resp, "store-region"),
+        "store_region_src": _ohg_cookie_from_response(resp, "store-region-src"),
+    }
+
+
+def _ohg_get_iv(iv: int, data: bytes) -> int:
+    value = iv & 0xFFFFFFFF
+    for i, b in enumerate(data):
+        if i & 1 == 0:
+            value = ((value >> 4) ^ value ^ ((value << 6) & 0xFFFFFFFF) ^ b) & 0xFFFFFFFF
+        else:
+            inner = ((value >> 7) ^ value ^ (b | ((value << 12) & 0xFFFFFFFF))) & 0xFFFFFFFF
+            value = (~inner) & 0xFFFFFFFF
+    return value
+
+
+def _ohg_branch_of(query_sm3: bytes, body_md5: bytes, ts_le: bytes) -> int:
+    iv = _ohg_get_iv(_ohg_get_iv(_ohg_get_iv(0x20230928, query_sm3), body_md5), ts_le)
+    low = iv & 15
+    return low - ((low * 171) >> 9) * 3
+
+
+def _ohg_varint(value: int) -> bytes:
+    out = bytearray()
+    while value > 127:
+        out.append((value & 127) | 128)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def _ohg_pb_varint(tag: int, value: int) -> bytes:
+    return _ohg_varint((tag << 3) | 0) + _ohg_varint(value)
+
+
+def _ohg_pb_bytes(tag: int, body: bytes) -> bytes:
+    return _ohg_varint((tag << 3) | 2) + _ohg_varint(len(body)) + body
+
+
+def _ohg_pb_string(tag: int, text: str) -> bytes:
+    return _ohg_pb_bytes(tag, text.encode("utf-8"))
+
+
+def _ohg_pkcs7(data: bytes) -> bytes:
+    pad = 16 - len(data) % 16
+    return data + bytes([pad]) * pad
+
+
+def _ohg_rol64(value: int, count: int) -> int:
+    count %= 64
+    return ((value << count) | (value >> (64 - count))) & 0xFFFFFFFFFFFFFFFF if count else value & 0xFFFFFFFFFFFFFFFF
+
+
+def _ohg_simon_encrypt(plain: bytearray) -> None:
+    sign_key = bytes.fromhex("fc78e0a9657a0c748ce51559903ccf03510e51d3cff232d71343e88a321c5304")
+    keys = [int.from_bytes(sign_key[i * 8:(i + 1) * 8], "little") for i in range(4)]
+    z = 0x3DC94C3A046D678B
+    for i in range(4, 72):
+        x = (_ror64(keys[i - 1], 3) ^ keys[i - 3]) & 0xFFFFFFFFFFFFFFFF
+        x ^= _ror64(x, 1)
+        keys.append(((~keys[i - 4]) & 0xFFFFFFFFFFFFFFFF) ^ x ^ ((z >> ((i - 4) % 62)) & 1) ^ 3)
+    for at in range(0, len(plain), 16):
+        a = int.from_bytes(plain[at:at + 8], "little")
+        b = int.from_bytes(plain[at + 8:at + 16], "little")
+        for rk in keys:
+            a, b = b, (a ^ (_ohg_rol64(b, 1) & _ohg_rol64(b, 8)) ^ _ohg_rol64(b, 2) ^ rk) & 0xFFFFFFFFFFFFFFFF
+        plain[at:at + 8] = a.to_bytes(8, "little")
+        plain[at + 8:at + 16] = b.to_bytes(8, "little")
+
+
+def _ohg_argus_header(query: str, body_md5: bytes, ts: int, nonce: int, aid: str, device_id: str, install_id: str) -> str:
+    body_hash = SM3(body_md5).digest()
+    query_bytes = query.encode("utf-8") if query else bytes(16)
+    query_hash = SM3(query_bytes).digest()
+    version_name = ""
+    for part in query.split("&"):
+        if part.startswith("version_name="):
+            version_name = part[len("version_name="):]
+    counters = _ohg_pb_varint(1, 1) + _ohg_pb_varint(2, 1) + _ohg_pb_varint(3, 1) + _ohg_pb_varint(7, 0xC792ECCC)
+    device = _ohg_pb_string(1, "NX551J") + _ohg_pb_varint(2, 8196) + _ohg_pb_varint(4, 0x80E0D800)
+    bean = b"".join([
+        _ohg_pb_varint(1, 1077940818), _ohg_pb_varint(2, 2), _ohg_pb_varint(3, nonce),
+        _ohg_pb_string(4, aid), _ohg_pb_string(5, device_id), _ohg_pb_string(6, "1611921764"),
+        _ohg_pb_string(7, version_name), _ohg_pb_string(8, "v04.04.05-ov-android"),
+        _ohg_pb_varint(9, 134744640), _ohg_pb_bytes(10, bytes(8)), _ohg_pb_varint(11, 0),
+        _ohg_pb_varint(12, (ts << 1) & 0xFFFFFFFFFFFFFFFF),
+        _ohg_pb_bytes(13, body_hash[:6]), _ohg_pb_bytes(14, query_hash[:6]),
+        _ohg_pb_bytes(15, counters), _ohg_pb_string(16, install_id),
+        _ohg_pb_string(20, "none"), _ohg_pb_varint(21, 738),
+        _ohg_pb_bytes(23, device), _ohg_pb_varint(25, 2),
+    ])
+    plain = bytearray(_ohg_pkcs7(bean))
+    _ohg_simon_encrypt(plain)
+    mask = bytes([0xF2, 0xF7, 0xFC, 0xFF, 0xF2, 0xF7, 0xFC, 0xFF])
+    tail = bytes([0xEA, 0xFB, 0x2C, 0xFE, 0x85, 0x68, 0x51, 0x91, 0x54])
+    frame = bytearray(mask + bytes(plain) + tail)
+    for i in range(len(mask), len(frame)):
+        frame[i] ^= mask[i % len(mask)]
+    frame = frame[::-1]
+    frame = _ohg_pkcs7(bytes(frame) + b"ao")
+    encrypted = _aes_cbc_encrypt(bytes.fromhex("d31e3718288a1027baab59f146a09a9c"), bytes.fromhex("ea180a0336ed352fcd24e4d50018ae54"), frame)
+    return base64.b64encode(b"\xf2\x81" + encrypted).decode()
+
+
+def _ohg_ladon_header(ts: int, nonce: int, aid: str) -> str:
+    seed = nonce.to_bytes(4, "little")
+    digest = hashlib.md5(seed + aid.encode("utf-8")).digest()
+    hex_key = digest.hex().encode("ascii")
+    k = int.from_bytes(hex_key[0:8], "little")
+    pending = [int.from_bytes(hex_key[8:16], "little"), int.from_bytes(hex_key[16:24], "little"), int.from_bytes(hex_key[24:32], "little")]
+    keys = []
+    for i in range(34):
+        keys.append(k)
+        x = ((_ror64(pending[0], 8) + k) & 0xFFFFFFFFFFFFFFFF) ^ i
+        pending = [pending[1], pending[2], x]
+        k = (x ^ _ohg_rol64(k, 3)) & 0xFFFFFFFFFFFFFFFF
+    plain = bytearray(_ohg_pkcs7(("%d-1611921764-%s" % (ts, aid)).encode("utf-8")))
+    for at in range(0, len(plain), 16):
+        a = int.from_bytes(plain[at:at + 8], "little")
+        b = int.from_bytes(plain[at + 8:at + 16], "little")
+        for rk in keys:
+            b = (rk ^ ((a + _ror64(b, 8)) & 0xFFFFFFFFFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
+            a = (b ^ _ohg_rol64(a, 3)) & 0xFFFFFFFFFFFFFFFF
+        plain[at:at + 8] = a.to_bytes(8, "little")
+        plain[at + 8:at + 16] = b.to_bytes(8, "little")
+    return base64.b64encode(seed + bytes(plain)).decode()
+
+
+def _ohg_encode_query(pairs: list) -> str:
+    def enc(text: str) -> str:
+        return quote(text, safe="-_.!~*'()")
+    return "&".join(enc(str(k)) + "=" + enc(str(v)) for k, v in pairs)
+
+
+def _ohg_playback_request(video_id: str, profile: Mapping[str, str], registered: Mapping[str, str]) -> dict[str, Any]:
+    device_id, install_id = registered["device_id"], registered["install_id"]
+    d = _OHG_DEVICE
+    pairs = [
+        ("iid", install_id), ("device_id", device_id), ("ac", "wifi"), ("channel", d["channel"]),
+        ("aid", "8662"), ("app_name", "novelread"), ("cdid", profile["cdid"]),
+        ("version_code", _OHG_VERSION_CODE), ("version_name", _OHG_VERSION_NAME),
+        ("device_platform", "android"), ("os", "android"), ("ssmix", "a"),
+        ("device_type", d["model"]), ("device_brand", d["brand"]), ("language", "zh"),
+        ("os_api", str(d["os_api"])), ("os_version", d["os_version"]),
+        ("manifest_version_code", _OHG_VERSION_CODE), ("resolution", d["resolution"]),
+        ("dpi", str(d["dpi"])), ("update_version_code", _OHG_VERSION_CODE),
+        ("host_abi", "arm64-v8a"), ("dragon_device_type", "phone"), ("pv_player", _OHG_VERSION_CODE),
+        ("compliance_status", "0"), ("need_personal_recommend", "1"), ("player_so_load", "1"),
+        ("is_android_pad_screen", "0"), ("openudid", profile["openudid"]),
+    ]
+    body = ('{"biz_param":{"need_all_video_definition":true,"video_id_type":0,"video_platform":3},"video_id":' + json.dumps(video_id) + "}").encode("utf-8")
+    body_md5 = hashlib.md5(body).digest()
+    base_ms = int(time.time() * 1000)
+    query, ticket, khronos = "", base_ms, base_ms // 1000
+    for offset in range(32):
+        ticket = base_ms + offset
+        khronos = ticket // 1000
+        query = _ohg_encode_query(pairs + [("ts", str(khronos)), ("_rticket", str(ticket))])
+        if _ohg_branch_of(SM3(query.encode("utf-8")).digest(), body_md5, khronos.to_bytes(4, "little")) != 1:
+            break
+    headers = {
+        "Accept": "application/json; charset=utf-8,application/x-protobuf",
+        "x-xs-from-web": "0", "x-ss-req-ticket": str(ticket), "x-tt-request-tag": "t=0;n=0",
+        "sdk-version": "2", "passport-sdk-version": "50561", "x-vc-bdturing-sdk-version": "3.7.2.cn",
+        "x-khronos": str(khronos),
+        "x-gorgon": _encrypt_gorgon(body, query, khronos, random.randint(0, 0xFFFF), "application/json; charset=UTF-8"),
+        "x-helios": _encrypt_helios(khronos, random.randint(0, 0xFFFFFFFF)),
+        "x-tt-dt": "",
+        "Content-Type": "application/json; charset=UTF-8",
+        "x-ss-stub": hashlib.md5(body).hexdigest().upper(),
+    }
+    headers["x-argus"] = _ohg_argus_header(query, body_md5, khronos, random.randint(0, 0xFFFFFFFF), "8662", device_id, install_id)
+    headers["x-ladon"] = _ohg_ladon_header(khronos, random.randint(0, 0xFFFFFFFF), "8662")
+    headers["User-Agent"] = _OHG_UA
+    headers["x-ss-dp"] = "8662"
+    headers["lc"] = "101"
+    headers["x-reading-request"] = "%d-%d" % (ticket, abs(random.randint(0, 0x7FFFFFFF)))
+    ttreq = str(registered.get("ttreq") or "")
+    if ttreq:
+        headers["Cookie"] = "passport_csrf_token=; passport_csrf_token_default=; store-region=" + str(registered.get("store_region") or "") + "; store-region-src=" + str(registered.get("store_region_src") or "") + "; install_id=" + install_id + "; ttreq=" + ttreq
+    url = "https://" + _OHG_API_HOST + _OHG_PLAYBACK_PATH + "?" + query
+    response = requests.post(url, headers=headers, data=body, timeout=30)
+    response_data = _json_response(response)
+    return _parse_video_model_response(response_data, video_id)
+
+
+def _ohg_video_model(video_id: str) -> dict[str, Any]:
+    """v4 取流：每台新设备只试一次 video_model，空了就换下一台新设备。"""
+    attempts: list[str] = []
+    for _ in range(_OHG_MAX_DEVICES):
+        profile = _ohg_new_profile()
+        try:
+            registered = _ohg_register_profile(profile)
+        except Exception as err:
+            # 新注册失败时退回旧注册（log.snssdk.com 简版），无 ttreq 也照样试一次
+            try:
+                pair = _register_device_pair()
+                if pair is None:
+                    raise HongguoPluginError("设备注册失败：%s" % err)
+                registered = {"device_id": pair[0], "install_id": pair[1], "ttreq": "", "store_region": "", "store_region_src": ""}
+            except Exception:
+                attempts.append("注册失败:%s" % err)
+                continue
+        try:
+            model = _ohg_playback_request(video_id, profile, registered)
+            try:
+                _STREAM_STATE["video_model_ok"] = "v4-video_model"
+            except Exception:
+                pass
+            return model
+        except Exception as err:
+            attempts.append("新设备:%s" % err)
+    try:
+        _STREAM_STATE["video_model_attempts"] = ";".join(attempts)
+    except Exception:
+        pass
+    raise HongguoPluginError("video_model 数据为空（v4 已试 %s）" % ", ".join(attempts))
+
+
+
+
 def _video_model(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
+    """v4：先走新协议 video_model；新协议出非空正文以外的异常时，才回退 v3 旧链。"""
+    try:
+        return _ohg_video_model(video_id)
+    except HongguoPluginError as err:
+        if _is_empty_model_error(err):
+            raise
+        return _video_model_v3(video_id, config)
+
+
+def _video_model_v3(video_id: str, config: Mapping[str, Any]) -> dict[str, Any]:
     """按顺序试多路取流，首路有数据即停；全空时把每路状态写进报错，供用户原样发回排障。
     v3 变体（按可能性排序）：
     1 signed-71332：原版（设备注册用 7.3.5.32，取流却报 7.1.3.32，版本不一致可能是被拒原因）；
