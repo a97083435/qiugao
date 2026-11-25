@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 import base64
 import binascii
@@ -366,6 +367,28 @@ _HG_MEM_CACHE: dict[str, tuple[float, bytes]] = {}
 _HG_MEM_CACHE_MAX = 2                     # 最多两集
 _HG_MEM_CACHE_MAX_BYTES = 96 * 1024 * 1024
 _HG_MEM_CACHE_MAX_AGE = 3600              # 1 小时
+
+# ---- 播放链路诊断日志：进程内存环形缓冲，不落盘（取自新上传版） ----
+# 播放失败时壳只显示"无法播放"，看不到真实原因；这里把取流各步骤记下来，
+# 播放失败后在手机浏览器打开 http://127.0.0.1:<端口>/hg_log 即可查看。
+_HG_LOGS: list = []          # deque 语义，用 list + 定长裁剪
+_HG_LOGS_LOCK = threading.Lock()
+_HG_LOGS_MAX = 300
+
+
+def _hg_log(msg: str) -> None:
+    try:
+        line = "[%s] %s" % (time.strftime("%m-%d %H:%M:%S"), str(msg))
+        with _HG_LOGS_LOCK:
+            _HG_LOGS.append(line)
+            while len(_HG_LOGS) > _HG_LOGS_MAX:
+                _HG_LOGS.pop(0)
+    except Exception:
+        pass
+    try:
+        print("[红果]", msg)
+    except Exception:
+        pass
 
 
 def _hg_cached_ok(body: Any) -> bool:
@@ -1525,9 +1548,11 @@ def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str,
                     model = _video_model(video_id, config, endpoint, sign_mode, single=single)
                     _sign_pref_mark(sign_mode)
                     _ep_pref_mark(single)
+                    _hg_log("video_model 成功 vid=%s single=%s sign=%s" % (video_id, single, sign_mode))
                     return model
                 except Exception as err:
                     last_err = err
+                    _hg_log("video_model 失败 vid=%s single=%s sign=%s err=%s" % (video_id, single, sign_mode, str(err)[:100]))
                     if isinstance(err, (requests.ConnectionError, requests.Timeout)):
                         net_err = True
                         break  # 断网/超时与签名、端点无关，交给外层换 host 重试
@@ -1546,6 +1571,7 @@ def _video_model_rotating(video_id: str, config: Mapping[str, Any]) -> dict[str,
         except (TypeError, AttributeError):
             config = pair
     print("[红果] video_model 5 轮双签名均失败：%s" % str(last_err)[:120])
+    _hg_log("video_model 5 轮双签名均失败 vid=%s err=%s" % (video_id, str(last_err)[:160]))
     raise last_err if last_err is not None else HongguoPluginError("video_model 为空")
 
 
@@ -1801,6 +1827,7 @@ def _stream_session(video_id: str, config: Mapping[str, Any] | None = None, qual
                         while len(store) >= _STREAM_MAX_SESSIONS:
                             store.pop(next(iter(store)), None)
                         store[cache_key] = sess
+                    _hg_log("会话就绪 vid=%s 请求档=%s 实际档=%s 类型=%s" % (video_id, _Q_LABEL.get(quality, quality), _Q_LABEL.get(want, want), "直通" if isinstance(sess, _PlainSession) else "本机解密"))
                     return sess
 
                 for want in wanted_order:
@@ -2087,6 +2114,25 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if route.startswith("/hg_dm"):
             self._serve_danmaku(body)
             return
+        if route.startswith("/hg_log"):
+            # 诊断日志：播放失败后在壳内/浏览器打开 /hg_log 看取流各步骤的真实原因
+            with _HG_LOGS_LOCK:
+                data = "\n".join(_HG_LOGS[-_HG_LOGS_MAX:]).encode("utf-8")
+            if not data:
+                data = b"(no logs yet)"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            if body:
+                try:
+                    self.wfile.write(data)
+                except OSError:
+                    pass
+            return
         if not route.endswith(".mp4"):
             self._fail(404, b"not found")
             return
@@ -2094,6 +2140,7 @@ class _StreamHandler(BaseHTTPRequestHandler):
         if not params["vid"]:
             self._fail(400, b"missing vid")
             return
+        _hg_log("播放请求 %s vid=%s q=%s Range=%s" % (route, params["vid"], params["quality"], self.headers.get("Range") or "-"))
         try:
             _DM_STREAM_HIT[str(params["vid"])] = time.time()
             _trim_store(_DM_STREAM_HIT, cap=512, max_age=86400)
@@ -2195,22 +2242,31 @@ class _StreamHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
+# _HG_DEBUG_BIND_ALL=True 时监听全网卡：方便用电脑浏览器打开
+# http://<设备IP>:10010/hg_log 看播放链路诊断日志；播放 URL 仍是 127.0.0.1 不受影响。
+# 默认 False 只监听本机，排查完成后改回 False。
+_HG_DEBUG_BIND_ALL = False
+
+
 def _start_stream_server() -> int:
     if ThreadingHTTPServer is None:
         return 0
     with _STREAM_LOCK:
         if _STREAM_STATE["port"]:
             return int(_STREAM_STATE["port"])
+        host = "0.0.0.0" if _HG_DEBUG_BIND_ALL else "127.0.0.1"
         for port in range(_STREAM_PORT_RANGE[0], _STREAM_PORT_RANGE[1]):
             try:
-                server = ThreadingHTTPServer(("127.0.0.1", port), _StreamHandler)
+                server = ThreadingHTTPServer((host, port), _StreamHandler)
             except OSError:
                 continue
             server.daemon_threads = True
             threading.Thread(target=server.serve_forever, daemon=True).start()
             _STREAM_STATE["port"] = port
             _STREAM_STATE["server"] = server
+            _hg_log("本机流服务已启动 127.0.0.1:%d" % port)
             return port
+    _hg_log("本机流服务启动失败：10010~10029 全被占用或禁止 bind")
     return 0
 
 def _b64(value: str) -> bytes:
@@ -5419,7 +5475,10 @@ def _hg_search_scan(key, page=1, max_pages=8):
 #       下面的实现与 Hiker 版 JS 逐字节一致（同输入同随机数下 x-ladon / x-argus
 #       完全相等），因此同一份签名在 TVBox 的 Chaquopy 里也能直接用。
 # =============================================================================
-_DM_ENABLED = True          # 总开关：关掉则 playerContent 不再挂弹幕
+# 兼容性说明：danmaku 是新版 OK影视（FongMi 新内核）才支持的字段，
+# 老版壳/蜂蜜旧版解析 playerContent 返回时遇到 danmaku 列表会解析失败 → 表现为不能播放。
+# 默认 False 保证新老版都能播；用新版壳且想要弹幕时改成 True 即可。
+_DM_ENABLED = False         # 总开关：关掉则 playerContent 不再挂弹幕（返回结构与 1112 一致）
 _DM_HOST = "api5-normal-lq.fqnovel.com"
 _DM_WINDOW_MS = 30000       # 每个取数窗口（毫秒）
 _DM_MAX_WINDOWS = 20        # 最多取 20 个窗口（约 10 分钟，覆盖短剧整集）
@@ -6447,8 +6506,9 @@ class Spider(_BaseSpider):
         return {"list": [{"vod_id": sid, "vod_name": str(s.get("series_name") or ""), "vod_pic": str(s.get("series_cover") or ""), "vod_year": "", "vod_area": "", "vod_director": "", "vod_actor": ",".join(actors), "vod_content": str(s.get("series_intro") or ""), "vod_remarks": str(s.get("episode_right_text") or ""), "vod_play_from": "$$$".join(play_from), "vod_play_url": "$$$".join(play_url)}]}
 
     def playerContent(self, flag, id, vipFlags=None):
-        # v6：先解析 v2 token（清晰度/series_id/vid），同步建好会话再回地址；
+        # v7 蜂蜜：先解析 v2 token（清晰度/series_id/vid），同步建好会话再回地址；
         # 建不好回明确 msg，不给死地址（死地址就是 ERROR_CODE_IO_BAD_HTTP_STATUS 的来源）。
+        _hg_log("playerContent 进入 flag=%r id=%r" % (flag, id))
         token_q, series_id, vid = _split_episode_token(id)
         if not str(vid).isdigit():
             return {
@@ -6470,6 +6530,22 @@ class Spider(_BaseSpider):
         cfg = {"device_id": self.device_id or "", "install_id": self.install_id or ""}
         session = None
         last_err = None
+
+        def _try_start_server(wait):
+            # 启本机服务对弹幕(直通路)/中转(CENC路)是加分项而非前提；宿主环境禁止
+            # bind 127.0.0.1 时 _start_stream_server 可能挂起，放线程里限时等，
+            # 拿不到端口就放弃，绝不让播放器干等。
+            box = {}
+            def _run():
+                try:
+                    box["port"] = _start_stream_server()
+                except Exception:
+                    pass
+            t = threading.Thread(target=_run, daemon=True)
+            t.start()
+            t.join(wait)
+            return box.get("port", 0)
+
         if getattr(self, "play_mode", "stream") != "proxy":
             try:
                 session = _stream_session(vid, cfg, q, series_id=series_id)
@@ -6486,41 +6562,18 @@ class Spider(_BaseSpider):
                 "header": {"User-Agent": MEDIA_UA},
             }
             # 直链路仍需本机端口挂弹幕：限时拉一把，拉不起来也不影响播放。
-            try:
-                box = {}
-                def _run():
-                    try:
-                        box["port"] = _start_stream_server()
-                    except Exception:
-                        pass
-                _t = threading.Thread(target=_run, daemon=True)
-                _t.start()
-                _t.join(1.5)
-                port = box.get("port", 0)
-            except Exception:
-                port = 0
+            # （_DM_ENABLED=False 时 _danmaku_payload 直接回 {}，不影响播放。）
+            port = _try_start_server(1.5)
             if port:
                 try:
                     result.update(self._danmaku_payload(port, vid))
                 except Exception:
                     pass
+            _hg_log("playerContent 交直链 vid=%s q=%s url=%s" % (vid, q, session.url[:120]))
             return result
         # 加密 CENC 流：只有会话真的建好了，才交 127.0.0.1 地址。
         if isinstance(session, _StreamSession):
-            port = 0
-            try:
-                box = {}
-                def _run2():
-                    try:
-                        box["port"] = _start_stream_server()
-                    except Exception:
-                        pass
-                _t2 = threading.Thread(target=_run2, daemon=True)
-                _t2.start()
-                _t2.join(3.0)
-                port = box.get("port", 0)
-            except Exception:
-                port = 0
+            port = _try_start_server(3.0)
             if port:
                 query = urlencode(
                     {
@@ -6542,8 +6595,10 @@ class Spider(_BaseSpider):
                     result.update(self._danmaku_payload(port, vid))
                 except Exception:
                     pass
+                _hg_log("playerContent 交本机流服务 vid=%s q=%s port=%d" % (vid, q, port))
                 return result
         # 会话没建好：先试壳代理（localProxy 会再取一次模型）。
+        _hg_log("本机流服务起不来或会话未建好 vid=%s q=%s，试壳代理" % (vid, q))
         if last_err is not None and _is_empty_model_error(last_err):
             try:
                 _warm_burst(vid, cfg, q, series_id=series_id)
@@ -6580,7 +6635,7 @@ class Spider(_BaseSpider):
         if getattr(self, "play_mode", "stream") == "proxy":
             _msg = "壳代理不可用：当前壳没给 getProxyUrl，请把 ext 里的 play_mode 改回 stream 再试"
         else:
-            _msg = "红果取流失败（v6）：%s" % (last_err or "媒体会话创建失败")
+            _msg = "红果取流失败（v7 蜂蜜）：%s" % (last_err or "媒体会话创建失败")
         return {
             "parse": 0,
             "jx": 0,
